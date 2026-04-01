@@ -7,7 +7,8 @@ const {
   AuditLogEvent,
   EmbedBuilder,
   PermissionsBitField,
-  ChannelType
+  ChannelType,
+  ActivityType
 } = require("discord.js");
 const {
   joinVoiceChannel,
@@ -27,7 +28,7 @@ const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
 const PORT = process.env.PORT || 3000;
 
 /* =========================
-   WEB SERVER
+   WEB SERVER / UPTIMEROBOT
 ========================= */
 const app = express();
 
@@ -37,6 +38,14 @@ app.get("/", (_, res) => {
 
 app.get("/health", (_, res) => {
   res.status(200).send("OK");
+});
+
+app.get("/ping", (_, res) => {
+  res.status(200).json({
+    status: "online",
+    bot: client?.user?.tag || "loading",
+    uptime: process.uptime()
+  });
 });
 
 app.use((_, res) => {
@@ -107,8 +116,7 @@ async function fetchExecutorFromAudit(guild) {
     });
 
     const entry = logs.entries.find((e) => {
-      if (!e) return false;
-      if (!e.executor) return false;
+      if (!e || !e.executor) return false;
       if (e.targetId !== guild.id) return false;
 
       const created = e.createdTimestamp || 0;
@@ -138,7 +146,7 @@ async function banExecutor(guild, executor, reason) {
     if (!botCanBan(me, targetMember)) {
       return {
         ok: false,
-        reason: "Botun rolü/yetkisi yetmiyor veya hedef sunucu sahibi."
+        reason: "Botun rolü yetmiyor veya hedef sunucu sahibi."
       };
     }
 
@@ -204,7 +212,7 @@ async function initializeProtectedVanity(guild) {
 async function joinConfiguredVoice(guild) {
   try {
     if (!VOICE_CHANNEL_ID) {
-      console.log("[VOICE] VOICE_CHANNEL_ID tanımlı değil, ses kanalına girilmeyecek.");
+      console.log("[VOICE] VOICE_CHANNEL_ID tanımlı değil.");
       return;
     }
 
@@ -241,7 +249,7 @@ async function joinConfiguredVoice(guild) {
       await entersState(connection, VoiceConnectionStatus.Ready, 15000);
       console.log(`[VOICE] Otomatik olarak "${channel.name}" kanalına katıldı.`);
     } catch (err) {
-      console.error("[VOICE] Bağlantı ready olmadı:", err);
+      console.error("[VOICE] Bağlantı hazır olmadı:", err);
     }
 
     connection.on("stateChange", async (_, newState) => {
@@ -267,11 +275,32 @@ async function joinConfiguredVoice(guild) {
   }
 }
 
+async function setBotPresence() {
+  try {
+    await client.user.setPresence({
+      status: "online",
+      activities: [
+        {
+          name: "URL'yi izliyor",
+          type: ActivityType.Streaming,
+          url: "https://www.twitch.tv/discord"
+        }
+      ]
+    });
+
+    console.log("[PRESENCE] Bot online + streaming olarak ayarlandı.");
+  } catch (err) {
+    console.error("[PRESENCE] Durum ayarlanamadı:", err);
+  }
+}
+
 /* =========================
    READY
 ========================= */
 client.once("ready", async () => {
   console.log(`[BOT] ${client.user.tag} olarak giriş yapıldı.`);
+
+  await setBotPresence();
 
   const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
   if (!guild) {
@@ -283,14 +312,6 @@ client.once("ready", async () => {
   if (!fullGuild) {
     console.error("[HATA] Sunucu fetch edilemedi.");
     return;
-  }
-
-  try {
-    await client.user.setPresence({
-      status: "invisible"
-    });
-  } catch (err) {
-    console.error("[PRESENCE] Durum ayarlanamadı:", err);
   }
 
   await initializeProtectedVanity(fullGuild);
@@ -407,7 +428,14 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
 });
 
 /* =========================
-   HATA YAKALAMA
+   EXTRA KEEPALIVE LOG
+========================= */
+setInterval(() => {
+  console.log(`[KEEPALIVE] Bot çalışıyor | ${new Date().toISOString()}`);
+}, 60_000);
+
+/* =========================
+   ERROR HANDLERS
 ========================= */
 process.on("unhandledRejection", (err) => {
   console.error("[unhandledRejection]", err);
