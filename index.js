@@ -8,7 +8,8 @@ const {
   EmbedBuilder,
   PermissionsBitField,
   ChannelType,
-  ActivityType
+  ActivityType,
+  Events
 } = require("discord.js");
 const {
   joinVoiceChannel,
@@ -25,7 +26,10 @@ const GUILD_ID = process.env.GUILD_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || null;
 const PROTECTED_VANITY = process.env.PROTECTED_VANITY || null;
 const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
+
+if (!TOKEN) console.error("[ENV] TOKEN eksik.");
+if (!GUILD_ID) console.error("[ENV] GUILD_ID eksik.");
 
 /* =========================
    WEB SERVER / UPTIMEROBOT
@@ -37,14 +41,20 @@ app.get("/", (_, res) => {
 });
 
 app.get("/health", (_, res) => {
-  res.status(200).send("OK");
+  res.status(200).json({
+    ok: true,
+    bot: client?.user?.tag || "loading",
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
 });
 
 app.get("/ping", (_, res) => {
   res.status(200).json({
     status: "online",
     bot: client?.user?.tag || "loading",
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    memory: process.memoryUsage().rss
   });
 });
 
@@ -52,7 +62,7 @@ app.use((_, res) => {
   res.status(200).send("Bot aktif.");
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`[WEB] Sunucu ${PORT} portunda aktif.`);
 });
 
@@ -72,6 +82,9 @@ const client = new Client({
 const vanityCache = new Map();
 const revertLocks = new Set();
 const recentActions = new Map();
+
+let startupFinished = false;
+let voiceJoinInProgress = false;
 
 /* =========================
    HELPERS
@@ -108,7 +121,7 @@ function botCanBan(me, targetMember) {
 
 async function fetchExecutorFromAudit(guild) {
   try {
-    await sleep(1200);
+    await sleep(1500);
 
     const logs = await guild.fetchAuditLogs({
       type: AuditLogEvent.GuildUpdate,
@@ -120,7 +133,7 @@ async function fetchExecutorFromAudit(guild) {
       if (e.targetId !== guild.id) return false;
 
       const created = e.createdTimestamp || 0;
-      return Date.now() - created < 15000;
+      return Date.now() - created < 20000;
     });
 
     return entry || null;
@@ -209,8 +222,32 @@ async function initializeProtectedVanity(guild) {
   }
 }
 
+async function setBotPresence() {
+  try {
+    if (!client.user) return;
+
+    await client.user.setPresence({
+      status: "online",
+      activities: [
+        {
+          name: "URL'yi izliyor",
+          type: ActivityType.Streaming,
+          url: "https://www.twitch.tv/discord"
+        }
+      ]
+    });
+
+    console.log("[PRESENCE] Bot online + streaming olarak ayarlandı.");
+  } catch (err) {
+    console.error("[PRESENCE] Durum ayarlanamadı:", err);
+  }
+}
+
 async function joinConfiguredVoice(guild) {
   try {
+    if (voiceJoinInProgress) return;
+    voiceJoinInProgress = true;
+
     if (!VOICE_CHANNEL_ID) {
       console.log("[VOICE] VOICE_CHANNEL_ID tanımlı değil.");
       return;
@@ -230,11 +267,32 @@ async function joinConfiguredVoice(guild) {
       return;
     }
 
+    const permissions = channel.permissionsFor(guild.members.me);
+    if (
+      !permissions ||
+      !permissions.has(PermissionsBitField.Flags.Connect)
+    ) {
+      console.log("[VOICE] Botun ses kanalına bağlanma izni yok.");
+      return;
+    }
+
     const existing = getVoiceConnection(guild.id);
     if (existing) {
+      const sameChannel = existing.joinConfig?.channelId === channel.id;
+      const healthy =
+        existing.state.status === VoiceConnectionStatus.Ready ||
+        existing.state.status === VoiceConnectionStatus.Connecting ||
+        existing.state.status === VoiceConnectionStatus.Signalling;
+
+      if (sameChannel && healthy) {
+        return;
+      }
+
       try {
         existing.destroy();
-      } catch {}
+      } catch (err) {
+        console.error("[VOICE] Eski bağlantı kapatılamadı:", err);
+      }
     }
 
     const connection = joinVoiceChannel({
@@ -245,77 +303,94 @@ async function joinConfiguredVoice(guild) {
       selfMute: false
     });
 
-    try {
-      await entersState(connection, VoiceConnectionStatus.Ready, 15000);
-      console.log(`[VOICE] Otomatik olarak "${channel.name}" kanalına katıldı.`);
-    } catch (err) {
-      console.error("[VOICE] Bağlantı hazır olmadı:", err);
-    }
-
     connection.on("stateChange", async (_, newState) => {
       try {
-        if (
-          newState.status === VoiceConnectionStatus.Disconnected ||
-          newState.status === VoiceConnectionStatus.Destroyed
-        ) {
-          console.log("[VOICE] Ses bağlantısı koptu, tekrar bağlanılıyor...");
-          await sleep(5000);
+        console.log(`[VOICE] Durum değişti: ${newState.status}`);
 
-          const retry = getVoiceConnection(guild.id);
-          if (!retry || retry.state.status === VoiceConnectionStatus.Destroyed) {
-            await joinConfiguredVoice(guild);
-          }
+        if (newState.status === VoiceConnectionStatus.Disconnected) {
+          console.log("[VOICE] Ses bağlantısı koptu, yeniden bağlanılacak.");
+          await sleep(5000);
+          await joinConfiguredVoice(guild);
+        }
+
+        if (newState.status === VoiceConnectionStatus.Destroyed) {
+          console.log("[VOICE] Ses bağlantısı destroy oldu, yeniden bağlanılacak.");
+          await sleep(5000);
+          await joinConfiguredVoice(guild);
         }
       } catch (err) {
-        console.error("[VOICE] Yeniden bağlanma hatası:", err);
+        console.error("[VOICE] stateChange hatası:", err);
       }
     });
+
+    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+    console.log(`[VOICE] Otomatik olarak "${channel.name}" kanalına katıldı.`);
   } catch (err) {
     console.error("[VOICE] Ses kanalına giriş hatası:", err);
+  } finally {
+    voiceJoinInProgress = false;
   }
 }
 
-async function setBotPresence() {
+async function bootstrap() {
   try {
-    await client.user.setPresence({
-      status: "online",
-      activities: [
-        {
-          name: "URL'yi izliyor",
-          type: ActivityType.Streaming,
-          url: "https://www.twitch.tv/discord"
-        }
-      ]
-    });
+    const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
+    if (!guild) {
+      console.error("[BOOT] GUILD_ID ile sunucu bulunamadı.");
+      return;
+    }
 
-    console.log("[PRESENCE] Bot online + streaming olarak ayarlandı.");
+    const fullGuild = await guild.fetch().catch(() => null);
+    if (!fullGuild) {
+      console.error("[BOOT] Sunucu fetch edilemedi.");
+      return;
+    }
+
+    await setBotPresence();
+
+    if (!startupFinished) {
+      await initializeProtectedVanity(fullGuild);
+      startupFinished = true;
+    }
+
+    await joinConfiguredVoice(fullGuild);
   } catch (err) {
-    console.error("[PRESENCE] Durum ayarlanamadı:", err);
+    console.error("[BOOT] Bootstrap hatası:", err);
   }
 }
 
 /* =========================
-   READY
+   READY / RESUME
 ========================= */
-client.once("ready", async () => {
+client.once(Events.ClientReady, async () => {
   console.log(`[BOT] ${client.user.tag} olarak giriş yapıldı.`);
+  await bootstrap();
+});
 
-  await setBotPresence();
+client.on("resume", async () => {
+  console.log("[CLIENT] Resume oldu.");
+  await bootstrap();
+});
 
-  const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
-  if (!guild) {
-    console.error("[HATA] GUILD_ID ile sunucu bulunamadı.");
-    return;
-  }
+client.on("shardDisconnect", (event, id) => {
+  console.error(`[SHARD] Disconnect | shard=${id} code=${event?.code || "unknown"}`);
+});
 
-  const fullGuild = await guild.fetch().catch(() => null);
-  if (!fullGuild) {
-    console.error("[HATA] Sunucu fetch edilemedi.");
-    return;
-  }
+client.on("shardReconnecting", (id) => {
+  console.log(`[SHARD] Reconnecting | shard=${id}`);
+});
 
-  await initializeProtectedVanity(fullGuild);
-  await joinConfiguredVoice(fullGuild);
+client.on("shardReady", async (id) => {
+  console.log(`[SHARD] Ready | shard=${id}`);
+  await bootstrap();
+});
+
+client.on("error", (err) => {
+  console.error("[CLIENT ERROR]", err);
+});
+
+client.on("warn", (info) => {
+  console.warn("[CLIENT WARN]", info);
 });
 
 /* =========================
@@ -329,8 +404,8 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
     const newCode = newGuild.vanityURLCode || null;
 
     if (oldCode === newCode) return;
-
     if (revertLocks.has(newGuild.id)) return;
+
     revertLocks.add(newGuild.id);
 
     const protectedCode =
@@ -346,7 +421,6 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
     const lastActionTime = recentActions.get(actionKey) || 0;
 
     if (Date.now() - lastActionTime < 5000) {
-      revertLocks.delete(newGuild.id);
       return;
     }
 
@@ -428,14 +502,38 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
 });
 
 /* =========================
-   EXTRA KEEPALIVE LOG
+   PERIODIC SELF-HEAL
 ========================= */
-setInterval(() => {
-  console.log(`[KEEPALIVE] Bot çalışıyor | ${new Date().toISOString()}`);
+setInterval(async () => {
+  try {
+    console.log(`[KEEPALIVE] Bot çalışıyor | ${new Date().toISOString()}`);
+
+    if (!client.isReady()) return;
+
+    await setBotPresence();
+
+    const guild = client.guilds.cache.get(GUILD_ID);
+    if (!guild) return;
+
+    if (VOICE_CHANNEL_ID) {
+      const connection = getVoiceConnection(guild.id);
+      const broken =
+        !connection ||
+        connection.state.status === VoiceConnectionStatus.Destroyed ||
+        connection.state.status === VoiceConnectionStatus.Disconnected;
+
+      if (broken) {
+        console.log("[SELF-HEAL] Ses bağlantısı eksik/kırık, yeniden bağlanılıyor.");
+        await joinConfiguredVoice(guild);
+      }
+    }
+  } catch (err) {
+    console.error("[SELF-HEAL] Hata:", err);
+  }
 }, 60_000);
 
 /* =========================
-   ERROR HANDLERS
+   PROCESS SAFETY
 ========================= */
 process.on("unhandledRejection", (err) => {
   console.error("[unhandledRejection]", err);
@@ -445,7 +543,21 @@ process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
 
+process.on("uncaughtExceptionMonitor", (err) => {
+  console.error("[uncaughtExceptionMonitor]", err);
+});
+
+process.on("SIGTERM", () => {
+  console.log("[PROCESS] SIGTERM alındı.");
+});
+
+process.on("SIGINT", () => {
+  console.log("[PROCESS] SIGINT alındı.");
+});
+
 /* =========================
    LOGIN
 ========================= */
-client.login(TOKEN);
+client.login(TOKEN).catch((err) => {
+  console.error("[LOGIN] Bot giriş yapamadı:", err);
+});
