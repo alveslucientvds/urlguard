@@ -1,3 +1,5 @@
+"use strict";
+
 require("dotenv").config();
 
 const express = require("express");
@@ -19,22 +21,56 @@ const {
 } = require("@discordjs/voice");
 
 /* =========================
+   BASIC RUNTIME HARDENING
+========================= */
+Error.stackTraceLimit = 50;
+process.setMaxListeners(30);
+
+/* =========================
    ENV
 ========================= */
-const TOKEN = process.env.TOKEN;
-const GUILD_ID = process.env.GUILD_ID;
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || null;
-const PROTECTED_VANITY = process.env.PROTECTED_VANITY || null;
-const VOICE_CHANNEL_ID = process.env.VOICE_CHANNEL_ID || null;
+const TOKEN = String(process.env.TOKEN || "").trim();
+const GUILD_ID = String(process.env.GUILD_ID || "").trim();
+const LOG_CHANNEL_ID = String(process.env.LOG_CHANNEL_ID || "").trim() || null;
+const PROTECTED_VANITY_RAW = String(process.env.PROTECTED_VANITY || "").trim() || null;
+const VOICE_CHANNEL_ID = String(process.env.VOICE_CHANNEL_ID || "").trim() || null;
 const PORT = Number(process.env.PORT) || 3000;
 
-if (!TOKEN) console.error("[ENV] TOKEN eksik.");
-if (!GUILD_ID) console.error("[ENV] GUILD_ID eksik.");
+function fatal(msg) {
+  console.error(`[FATAL] ${msg}`);
+  process.exit(1);
+}
+
+if (!TOKEN) fatal("TOKEN eksik.");
+if (!GUILD_ID) fatal("GUILD_ID eksik.");
+
+const VANITY_CODE_REGEX = /^[a-zA-Z0-9-]{2,32}$/;
+
+function normalizeVanityCode(input) {
+  if (!input) return null;
+  let value = String(input).trim();
+
+  value = value
+    .replace(/^https?:\/\/(www\.)?discord\.(gg|com\/invite)\//i, "")
+    .replace(/^discord\.(gg|com\/invite)\//i, "")
+    .replace(/^\/+/, "")
+    .trim();
+
+  if (!VANITY_CODE_REGEX.test(value)) {
+    console.warn(`[ENV] PROTECTED_VANITY geçersiz görünüyor: ${input}`);
+    return null;
+  }
+
+  return value;
+}
+
+const PROTECTED_VANITY = normalizeVanityCode(PROTECTED_VANITY_RAW);
 
 /* =========================
    WEB SERVER / UPTIMEROBOT
 ========================= */
 const app = express();
+app.disable("x-powered-by");
 
 app.get("/", (_, res) => {
   res.status(200).send("URL Guard bot aktif.");
@@ -43,8 +79,10 @@ app.get("/", (_, res) => {
 app.get("/health", (_, res) => {
   res.status(200).json({
     ok: true,
+    ready: client.isReady(),
     bot: client?.user?.tag || "loading",
     uptimeSeconds: Math.floor(process.uptime()),
+    memoryRss: process.memoryUsage().rss,
     timestamp: new Date().toISOString()
   });
 });
@@ -52,9 +90,9 @@ app.get("/health", (_, res) => {
 app.get("/ping", (_, res) => {
   res.status(200).json({
     status: "online",
-    bot: client?.user?.tag || "loading",
-    uptime: process.uptime(),
-    memory: process.memoryUsage().rss
+    ready: client.isReady(),
+    wsPing: client.ws?.ping ?? null,
+    uptimeSeconds: Math.floor(process.uptime())
   });
 });
 
@@ -62,8 +100,12 @@ app.use((_, res) => {
   res.status(200).send("Bot aktif.");
 });
 
-app.listen(PORT, "0.0.0.0", () => {
+const webServer = app.listen(PORT, "0.0.0.0", () => {
   console.log(`[WEB] Sunucu ${PORT} portunda aktif.`);
+});
+
+webServer.on("error", (err) => {
+  console.error("[WEB] Sunucu hatası:", err);
 });
 
 /* =========================
@@ -72,75 +114,190 @@ app.listen(PORT, "0.0.0.0", () => {
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates
-  ]
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
+  ],
+  allowedMentions: {
+    parse: [],
+    repliedUser: false
+  }
 });
 
 /* =========================
    CACHE / STATE
 ========================= */
-const vanityCache = new Map();
-const revertLocks = new Set();
-const recentActions = new Map();
+const vanityCache = new Map();        // guildId -> protected vanity
+const revertLocks = new Map();        // guildId -> unlock timestamp
+const recentActions = new Map();      // key -> timestamp
+const recentLogKeys = new Map();      // anti log spam
+const voiceReconnectState = new Map();// guildId -> attempt count
 
 let startupFinished = false;
 let voiceJoinInProgress = false;
+let keepAliveRunning = false;
 
 /* =========================
    HELPERS
 ========================= */
 function nowTr() {
-  return new Date().toLocaleString("tr-TR");
+  return new Date().toLocaleString("tr-TR", {
+    dateStyle: "short",
+    timeStyle: "medium"
+  });
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function getLogChannel(guild) {
-  if (!LOG_CHANNEL_ID) return null;
-  return guild.channels.cache.get(LOG_CHANNEL_ID) || null;
+function cleanString(value, max = 1000) {
+  if (value == null) return "Yok";
+  const str = String(value)
+    .replace(/[`]/g, "'")
+    .replace(/<@&?\d+>/g, "[mention-redacted]")
+    .replace(/<@!?\d+>/g, "[mention-redacted]")
+    .replace(/@everyone/g, "@ everyone")
+    .replace(/@here/g, "@ here")
+    .trim();
+
+  return str.length > max ? `${str.slice(0, max - 3)}...` : str || "Yok";
 }
 
-async function sendLog(guild, embed) {
+function isLockActive(guildId) {
+  const until = revertLocks.get(guildId) || 0;
+  if (Date.now() >= until) {
+    revertLocks.delete(guildId);
+    return false;
+  }
+  return true;
+}
+
+function setLock(guildId, ms) {
+  revertLocks.set(guildId, Date.now() + ms);
+}
+
+function dedupeEvent(key, windowMs) {
+  const last = recentActions.get(key) || 0;
+  if (Date.now() - last < windowMs) return true;
+  recentActions.set(key, Date.now());
+  return false;
+}
+
+function dedupeLog(key, windowMs) {
+  const last = recentLogKeys.get(key) || 0;
+  if (Date.now() - last < windowMs) return true;
+  recentLogKeys.set(key, Date.now());
+  return false;
+}
+
+function cleanupMaps() {
+  const now = Date.now();
+
+  for (const [k, v] of recentActions.entries()) {
+    if (now - v > 5 * 60_000) recentActions.delete(k);
+  }
+
+  for (const [k, v] of recentLogKeys.entries()) {
+    if (now - v > 5 * 60_000) recentLogKeys.delete(k);
+  }
+
+  for (const [k, v] of revertLocks.entries()) {
+    if (now >= v) revertLocks.delete(k);
+  }
+}
+
+function getLogChannel(guild) {
+  if (!LOG_CHANNEL_ID) return null;
+  const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
+  if (!channel) return null;
+  if (!channel.isTextBased()) return null;
+  return channel;
+}
+
+async function sendLog(guild, embed, dedupeKey = null) {
   try {
+    if (dedupeKey && dedupeLog(dedupeKey, 4000)) return;
+
     const logChannel = getLogChannel(guild);
-    if (!logChannel || !logChannel.isTextBased()) return;
-    await logChannel.send({ embeds: [embed] });
+    if (!logChannel) return;
+
+    await logChannel.send({
+      embeds: [embed],
+      allowedMentions: { parse: [] }
+    });
   } catch (err) {
     console.error("[LOG] Log gönderilemedi:", err);
   }
+}
+
+function getBotMember(guild) {
+  return guild.members.me ?? null;
 }
 
 function botCanBan(me, targetMember) {
   if (!me || !targetMember) return false;
   if (!me.permissions.has(PermissionsBitField.Flags.BanMembers)) return false;
   if (targetMember.id === targetMember.guild.ownerId) return false;
+  if (targetMember.id === me.id) return false;
   return me.roles.highest.position > targetMember.roles.highest.position;
 }
 
-async function fetchExecutorFromAudit(guild) {
-  try {
-    await sleep(1500);
+function botCanManageGuild(me) {
+  if (!me) return false;
+  return me.permissions.has(PermissionsBitField.Flags.ManageGuild);
+}
 
-    const logs = await guild.fetchAuditLogs({
-      type: AuditLogEvent.GuildUpdate,
-      limit: 10
-    });
+function botCanViewAudit(me) {
+  if (!me) return false;
+  return me.permissions.has(PermissionsBitField.Flags.ViewAuditLog);
+}
 
-    const entry = logs.entries.find((e) => {
-      if (!e || !e.executor) return false;
-      if (e.targetId !== guild.id) return false;
-
-      const created = e.createdTimestamp || 0;
-      return Date.now() - created < 20000;
-    });
-
-    return entry || null;
-  } catch (err) {
-    console.error("[AUDIT] Audit log çekilemedi:", err);
+async function fetchExecutorFromAudit(guild, expectedNewCode = null) {
+  const me = getBotMember(guild);
+  if (!botCanViewAudit(me)) {
+    console.warn("[AUDIT] Botta ViewAuditLog izni yok.");
     return null;
   }
+
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      await sleep(1200 * attempt);
+
+      const logs = await guild.fetchAuditLogs({
+        type: AuditLogEvent.GuildUpdate,
+        limit: 8
+      });
+
+      const entry = logs.entries.find((e) => {
+        if (!e || !e.executor) return false;
+        if (e.targetId !== guild.id) return false;
+
+        const created = e.createdTimestamp || 0;
+        if (Date.now() - created > 25_000) return false;
+
+        if (!e.changes || !Array.isArray(e.changes)) return true;
+
+        const vanityChange = e.changes.find((c) => c.key === "vanity_url_code");
+        if (!vanityChange) return false;
+
+        if (expectedNewCode !== null) {
+          const newValue = vanityChange.new ?? null;
+          if ((newValue || null) !== (expectedNewCode || null)) {
+            return false;
+          }
+        }
+
+        return true;
+      });
+
+      if (entry) return entry;
+    } catch (err) {
+      console.error(`[AUDIT] Audit log çekilemedi (deneme ${attempt}):`, err);
+    }
+  }
+
+  return null;
 }
 
 async function banExecutor(guild, executor, reason) {
@@ -149,8 +306,12 @@ async function banExecutor(guild, executor, reason) {
       return { ok: false, reason: "İşlemi yapan kullanıcı bulunamadı." };
     }
 
-    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
-    const targetMember = await guild.members.fetch(executor.id).catch(() => null);
+    const me =
+      guild.members.me || (await guild.members.fetchMe().catch(() => null));
+
+    const targetMember = await guild.members
+      .fetch(executor.id)
+      .catch(() => null);
 
     if (!targetMember) {
       return { ok: false, reason: "Kullanıcı sunucuda bulunamadı." };
@@ -159,22 +320,30 @@ async function banExecutor(guild, executor, reason) {
     if (!botCanBan(me, targetMember)) {
       return {
         ok: false,
-        reason: "Botun rolü yetmiyor veya hedef sunucu sahibi."
+        reason: "Botun yetkisi/rol sırası yetersiz veya hedef sunucu sahibi."
       };
     }
 
-    await guild.members.ban(executor.id, { reason });
+    await guild.members.ban(executor.id, {
+      reason: cleanString(reason, 480)
+    });
+
     return { ok: true };
   } catch (err) {
     console.error("[BAN] Ban atılamadı:", err);
-    return { ok: false, reason: err.message || "Bilinmeyen hata" };
+    return { ok: false, reason: cleanString(err.message || "Bilinmeyen hata", 300) };
   }
 }
 
 async function revertVanity(guild, protectedCode) {
   try {
     if (!protectedCode) {
-      return { ok: false, reason: "Korunan URL kodu bulunamadı." };
+      return { ok: false, reason: "Korunan vanity kodu bulunamadı." };
+    }
+
+    const me = getBotMember(guild);
+    if (!botCanManageGuild(me)) {
+      return { ok: false, reason: "Botta ManageGuild izni yok." };
     }
 
     await guild.edit(
@@ -185,7 +354,7 @@ async function revertVanity(guild, protectedCode) {
     return { ok: true };
   } catch (err) {
     console.error("[REVERT] Vanity geri alınamadı:", err);
-    return { ok: false, reason: err.message || "Bilinmeyen hata" };
+    return { ok: false, reason: cleanString(err.message || "Bilinmeyen hata", 300) };
   }
 }
 
@@ -207,7 +376,7 @@ async function initializeProtectedVanity(guild) {
       .setTitle("Koruma Sistemi Aktif")
       .setDescription(
         [
-          `**Sunucu:** ${guild.name}`,
+          `**Sunucu:** ${cleanString(guild.name, 100)}`,
           `**Korunan URL:** ${protectedCode ? `discord.gg/${protectedCode}` : "Yok"}`,
           `**Saat:** ${nowTr()}`
         ].join("\n")
@@ -216,7 +385,17 @@ async function initializeProtectedVanity(guild) {
       .setFooter({ text: "Sistem başarıyla başlatıldı." })
       .setTimestamp();
 
-    await sendLog(guild, embed);
+    await sendLog(guild, embed, `init:${guild.id}`);
+
+    if (
+      PROTECTED_VANITY &&
+      currentCode &&
+      currentCode !== PROTECTED_VANITY
+    ) {
+      console.warn(
+        `[INIT] Mevcut vanity (${currentCode}) ile PROTECTED_VANITY (${PROTECTED_VANITY}) farklı.`
+      );
+    }
   } catch (err) {
     console.error("[INIT] Protected vanity başlatılamadı:", err);
   }
@@ -227,32 +406,26 @@ async function setBotPresence() {
     if (!client.user) return;
 
     await client.user.setPresence({
-      status: "online",
+      status: "dnd",
       activities: [
         {
-          name: "URL'yi izliyor",
-          type: ActivityType.Streaming,
-          url: "https://www.twitch.tv/discord"
+          name: "URL'yi koruyor",
+          type: ActivityType.Watching
         }
       ]
     });
-
-    console.log("[PRESENCE] Bot online + streaming olarak ayarlandı.");
   } catch (err) {
     console.error("[PRESENCE] Durum ayarlanamadı:", err);
   }
 }
 
 async function joinConfiguredVoice(guild) {
+  if (!VOICE_CHANNEL_ID) return;
+  if (voiceJoinInProgress) return;
+
+  voiceJoinInProgress = true;
+
   try {
-    if (voiceJoinInProgress) return;
-    voiceJoinInProgress = true;
-
-    if (!VOICE_CHANNEL_ID) {
-      console.log("[VOICE] VOICE_CHANNEL_ID tanımlı değil.");
-      return;
-    }
-
     const channel = await guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
     if (!channel) {
       console.log("[VOICE] Ses kanalı bulunamadı.");
@@ -267,7 +440,9 @@ async function joinConfiguredVoice(guild) {
       return;
     }
 
-    const permissions = channel.permissionsFor(guild.members.me);
+    const me = getBotMember(guild);
+    const permissions = channel.permissionsFor(me);
+
     if (
       !permissions ||
       !permissions.has(PermissionsBitField.Flags.Connect)
@@ -276,17 +451,23 @@ async function joinConfiguredVoice(guild) {
       return;
     }
 
+    if (
+      channel.type === ChannelType.GuildStageVoice &&
+      !permissions.has(PermissionsBitField.Flags.RequestToSpeak)
+    ) {
+      console.log("[VOICE] Stage kanalında RequestToSpeak izni yok.");
+    }
+
     const existing = getVoiceConnection(guild.id);
     if (existing) {
       const sameChannel = existing.joinConfig?.channelId === channel.id;
-      const healthy =
-        existing.state.status === VoiceConnectionStatus.Ready ||
-        existing.state.status === VoiceConnectionStatus.Connecting ||
-        existing.state.status === VoiceConnectionStatus.Signalling;
+      const healthy = [
+        VoiceConnectionStatus.Ready,
+        VoiceConnectionStatus.Connecting,
+        VoiceConnectionStatus.Signalling
+      ].includes(existing.state.status);
 
-      if (sameChannel && healthy) {
-        return;
-      }
+      if (sameChannel && healthy) return;
 
       try {
         existing.destroy();
@@ -305,25 +486,29 @@ async function joinConfiguredVoice(guild) {
 
     connection.on("stateChange", async (_, newState) => {
       try {
-        console.log(`[VOICE] Durum değişti: ${newState.status}`);
+        if (
+          newState.status === VoiceConnectionStatus.Disconnected ||
+          newState.status === VoiceConnectionStatus.Destroyed
+        ) {
+          const attempts = (voiceReconnectState.get(guild.id) || 0) + 1;
+          voiceReconnectState.set(guild.id, attempts);
 
-        if (newState.status === VoiceConnectionStatus.Disconnected) {
-          console.log("[VOICE] Ses bağlantısı koptu, yeniden bağlanılacak.");
-          await sleep(5000);
+          const wait = Math.min(5000 * attempts, 30000);
+          console.log(`[VOICE] Bağlantı koptu. ${wait}ms sonra yeniden denenecek.`);
+          await sleep(wait);
           await joinConfiguredVoice(guild);
         }
 
-        if (newState.status === VoiceConnectionStatus.Destroyed) {
-          console.log("[VOICE] Ses bağlantısı destroy oldu, yeniden bağlanılacak.");
-          await sleep(5000);
-          await joinConfiguredVoice(guild);
+        if (newState.status === VoiceConnectionStatus.Ready) {
+          voiceReconnectState.set(guild.id, 0);
         }
       } catch (err) {
         console.error("[VOICE] stateChange hatası:", err);
       }
     });
 
-    await entersState(connection, VoiceConnectionStatus.Ready, 20000);
+    await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+    voiceReconnectState.set(guild.id, 0);
     console.log(`[VOICE] Otomatik olarak "${channel.name}" kanalına katıldı.`);
   } catch (err) {
     console.error("[VOICE] Ses kanalına giriş hatası:", err);
@@ -356,6 +541,80 @@ async function bootstrap() {
     await joinConfiguredVoice(fullGuild);
   } catch (err) {
     console.error("[BOOT] Bootstrap hatası:", err);
+  }
+}
+
+async function verifyVanityIntegrity(guild) {
+  try {
+    const protectedCode = vanityCache.get(guild.id) || PROTECTED_VANITY || null;
+    if (!protectedCode) return;
+
+    const freshGuild = await guild.fetch().catch(() => null);
+    if (!freshGuild) return;
+
+    const liveCode = freshGuild.vanityURLCode || null;
+    if (liveCode === protectedCode) return;
+
+    if (isLockActive(guild.id)) return;
+
+    setLock(guild.id, 10_000);
+
+    const auditEntry = await fetchExecutorFromAudit(freshGuild, liveCode);
+    const executor = auditEntry?.executor || null;
+
+    const revertResult = await revertVanity(freshGuild, protectedCode);
+
+    let banResult = { ok: false, reason: "Yapan kişi bulunamadı." };
+    if (executor) {
+      banResult = await banExecutor(
+        freshGuild,
+        executor,
+        `URL Guard self-heal: Vanity URL yetkisiz değişiklik. Korunan URL: ${protectedCode}`
+      );
+    }
+
+    if (revertResult.ok) {
+      vanityCache.set(guild.id, protectedCode);
+    }
+
+    const embed = new EmbedBuilder()
+      .setAuthor({
+        name: "URL GUARD",
+        iconURL: client.user.displayAvatarURL()
+      })
+      .setTitle("Self-Heal Vanity Müdahalesi")
+      .setDescription(
+        [
+          "Periyodik kontrolde korunan vanity URL ile canlı değer farklı bulundu.",
+          `**Korunan URL:** ${protectedCode ? `discord.gg/${protectedCode}` : "Yok"}`,
+          `**Canlı Değer:** ${liveCode ? `discord.gg/${liveCode}` : "Silinmiş / Boş"}`
+        ].join("\n")
+      )
+      .addFields(
+        {
+          name: "İşlemi Yapan",
+          value: executor
+            ? `<@${executor.id}>\n\`${cleanString(executor.tag, 80)}\`\n\`${executor.id}\``
+            : "Bulunamadı",
+          inline: true
+        },
+        {
+          name: "Ban Durumu",
+          value: banResult.ok ? "✅ Başarılı" : `❌ ${cleanString(banResult.reason, 120)}`,
+          inline: true
+        },
+        {
+          name: "URL Geri Yüklendi",
+          value: revertResult.ok ? "✅ Evet" : `❌ ${cleanString(revertResult.reason, 120)}`,
+          inline: true
+        }
+      )
+      .setColor(0xfaa61a)
+      .setTimestamp();
+
+    await sendLog(freshGuild, embed, `selfheal:${guild.id}:${liveCode || "none"}`);
+  } catch (err) {
+    console.error("[SELF-HEAL] Vanity integrity hatası:", err);
   }
 }
 
@@ -404,9 +663,9 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
     const newCode = newGuild.vanityURLCode || null;
 
     if (oldCode === newCode) return;
-    if (revertLocks.has(newGuild.id)) return;
+    if (isLockActive(newGuild.id)) return;
 
-    revertLocks.add(newGuild.id);
+    setLock(newGuild.id, 12_000);
 
     const protectedCode =
       vanityCache.get(newGuild.id) ||
@@ -414,23 +673,28 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
       oldCode ||
       null;
 
-    const auditEntry = await fetchExecutorFromAudit(newGuild);
-    const executor = auditEntry?.executor || null;
-
-    const actionKey = `${newGuild.id}:${executor?.id || "unknown"}`;
-    const lastActionTime = recentActions.get(actionKey) || 0;
-
-    if (Date.now() - lastActionTime < 5000) {
+    if (!protectedCode) {
+      console.warn("[URL GUARD] Korunan vanity bulunamadı, revert yapılamadı.");
       return;
     }
 
-    recentActions.set(actionKey, Date.now());
+    const eventKey = `guildUpdate:${newGuild.id}:${newCode || "null"}`;
+    if (dedupeEvent(eventKey, 5000)) return;
 
-    const banReason = `URL Guard: Sunucunun vanity URL'sini değiştirmeye veya silmeye çalıştı. Korunan URL: ${protectedCode || "bilinmiyor"}`;
+    const auditEntry = await fetchExecutorFromAudit(newGuild, newCode);
+    const executor = auditEntry?.executor || null;
 
-    const banResult = executor
-      ? await banExecutor(newGuild, executor, banReason)
-      : { ok: false, reason: "Yapan kişi audit log üzerinden bulunamadı." };
+    let banResult = { ok: false, reason: "Yapan kişi audit log üzerinden bulunamadı." };
+
+    if (executor && executor.id !== client.user.id) {
+      const banReason =
+        `URL Guard: Sunucunun vanity URL'sini değiştirmeye veya silmeye çalıştı. ` +
+        `Korunan URL: ${protectedCode}`;
+
+      banResult = await banExecutor(newGuild, executor, banReason);
+    } else if (executor && executor.id === client.user.id) {
+      banResult = { ok: false, reason: "İşlem bot tarafından yapıldı, ban atılmadı." };
+    }
 
     const revertResult = await revertVanity(newGuild, protectedCode);
 
@@ -457,7 +721,7 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
         {
           name: "İşlemi Yapan",
           value: executor
-            ? `<@${executor.id}>\n\`${executor.tag}\`\n\`${executor.id}\``
+            ? `<@${executor.id}>\n\`${cleanString(executor.tag, 80)}\`\n\`${executor.id}\``
             : "Bulunamadı",
           inline: true
         },
@@ -465,14 +729,14 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
           name: "Ban Durumu",
           value: banResult.ok
             ? "✅ Başarılı"
-            : `❌ Başarısız\n${banResult.reason}`,
+            : `❌ ${cleanString(banResult.reason, 180)}`,
           inline: true
         },
         {
           name: "URL Geri Yüklendi",
           value: revertResult.ok
             ? "✅ Evet"
-            : `❌ Hayır\n${revertResult.reason}`,
+            : `❌ ${cleanString(revertResult.reason, 180)}`,
           inline: true
         }
       )
@@ -483,21 +747,21 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
           : client.user.displayAvatarURL({ size: 256, extension: "png" })
       )
       .setFooter({
-        text: `${newGuild.name} • ${nowTr()}`
+        text: `${cleanString(newGuild.name, 60)} • ${nowTr()}`
       })
       .setTimestamp();
 
-    await sendLog(newGuild, embed);
+    await sendLog(
+      newGuild,
+      embed,
+      `guard:${newGuild.id}:${oldCode || "old-none"}:${newCode || "new-none"}`
+    );
 
     console.log(
       `[URL GUARD] Değişiklik algılandı | eski=${oldCode} yeni=${newCode} korunan=${protectedCode} yapan=${executor?.tag || "bulunamadı"}`
     );
   } catch (err) {
     console.error("[guildUpdate] Hata:", err);
-  } finally {
-    setTimeout(() => {
-      revertLocks.delete(newGuild.id);
-    }, 3000);
   }
 });
 
@@ -505,8 +769,11 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
    PERIODIC SELF-HEAL
 ========================= */
 setInterval(async () => {
+  if (keepAliveRunning) return;
+  keepAliveRunning = true;
+
   try {
-    console.log(`[KEEPALIVE] Bot çalışıyor | ${new Date().toISOString()}`);
+    cleanupMaps();
 
     if (!client.isReady()) return;
 
@@ -514,6 +781,8 @@ setInterval(async () => {
 
     const guild = client.guilds.cache.get(GUILD_ID);
     if (!guild) return;
+
+    await verifyVanityIntegrity(guild);
 
     if (VOICE_CHANNEL_ID) {
       const connection = getVoiceConnection(guild.id);
@@ -529,14 +798,16 @@ setInterval(async () => {
     }
   } catch (err) {
     console.error("[SELF-HEAL] Hata:", err);
+  } finally {
+    keepAliveRunning = false;
   }
 }, 60_000);
 
 /* =========================
    PROCESS SAFETY
 ========================= */
-process.on("unhandledRejection", (err) => {
-  console.error("[unhandledRejection]", err);
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
 });
 
 process.on("uncaughtException", (err) => {
@@ -547,12 +818,20 @@ process.on("uncaughtExceptionMonitor", (err) => {
   console.error("[uncaughtExceptionMonitor]", err);
 });
 
-process.on("SIGTERM", () => {
-  console.log("[PROCESS] SIGTERM alındı.");
+process.on("SIGTERM", async () => {
+  try {
+    console.log("[PROCESS] SIGTERM alındı.");
+    client.destroy();
+  } catch {}
+  process.exit(0);
 });
 
-process.on("SIGINT", () => {
-  console.log("[PROCESS] SIGINT alındı.");
+process.on("SIGINT", async () => {
+  try {
+    console.log("[PROCESS] SIGINT alındı.");
+    client.destroy();
+  } catch {}
+  process.exit(0);
 });
 
 /* =========================
@@ -560,4 +839,5 @@ process.on("SIGINT", () => {
 ========================= */
 client.login(TOKEN).catch((err) => {
   console.error("[LOGIN] Bot giriş yapamadı:", err);
+  process.exit(1);
 });
