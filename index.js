@@ -24,7 +24,7 @@ const {
    BASIC RUNTIME HARDENING
 ========================= */
 Error.stackTraceLimit = 50;
-process.setMaxListeners(50);
+process.setMaxListeners(100);
 
 /* =========================
    ENV
@@ -90,12 +90,16 @@ const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", true);
 
+let lastHeartbeatAt = Date.now();
+
 app.get("/", (_, res) => {
+  lastHeartbeatAt = Date.now();
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).send("URL Guard bot aktif.");
 });
 
 app.get("/health", (_, res) => {
+  lastHeartbeatAt = Date.now();
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
     ok: true,
@@ -103,13 +107,21 @@ app.get("/health", (_, res) => {
     bot: client?.user?.tag || "loading",
     wsPing: client.ws?.ping ?? null,
     uptimeSeconds: Math.floor(process.uptime()),
-    memoryRss: process.memoryUsage().rss,
+    memory: {
+      rss: process.memoryUsage().rss,
+      heapUsed: process.memoryUsage().heapUsed,
+      heapTotal: process.memoryUsage().heapTotal
+    },
     guildId: GUILD_ID,
+    voiceConfigured: Boolean(VOICE_CHANNEL_ID),
+    protectedVanity: PROTECTED_VANITY,
+    lastHeartbeatAt,
     timestamp: new Date().toISOString()
   });
 });
 
 app.get("/ping", (_, res) => {
+  lastHeartbeatAt = Date.now();
   res.setHeader("Cache-Control", "no-store");
   return res.status(200).json({
     status: "online",
@@ -121,7 +133,8 @@ app.get("/ping", (_, res) => {
 });
 
 app.use((_, res) => {
-  res.status(200).send("Bot aktif.");
+  lastHeartbeatAt = Date.now();
+  return res.status(200).send("Bot aktif.");
 });
 
 const webServer = app.listen(PORT, "0.0.0.0", () => {
@@ -146,16 +159,19 @@ webServer.on("clientError", (err, socket) => {
 /* =========================
    CACHE / STATE
 ========================= */
-const vanityCache = new Map();          // guildId -> protected vanity
-const revertLocks = new Map();          // guildId -> unlock timestamp
-const recentActions = new Map();        // key -> timestamp
-const recentLogKeys = new Map();        // anti log spam
-const voiceReconnectState = new Map();  // guildId -> reconnect attempt count
+const vanityCache = new Map();             // guildId -> protected vanity
+const revertLocks = new Map();             // guildId -> unlock timestamp
+const recentActions = new Map();           // key -> timestamp
+const recentLogKeys = new Map();           // anti log spam
+const voiceReconnectState = new Map();     // guildId -> reconnect attempt count
+const voiceJoinLocks = new Map();          // guildId -> boolean
+const voiceReconnectTimers = new Map();    // guildId -> Timeout
+const guildBootstrapLocks = new Map();     // guildId -> boolean
 
 let startupFinished = false;
 let bootstrapRunning = false;
-let voiceJoinInProgress = false;
 let keepAliveRunning = false;
+let shuttingDown = false;
 
 /* =========================
    HELPERS
@@ -183,6 +199,18 @@ function cleanString(value, max = 1000) {
     .trim();
 
   return str.length > max ? `${str.slice(0, max - 3)}...` : (str || "Yok");
+}
+
+function safeTimeout(fn, ms) {
+  const t = setTimeout(fn, ms);
+  if (typeof t.unref === "function") t.unref();
+  return t;
+}
+
+function safeInterval(fn, ms) {
+  const t = setInterval(fn, ms);
+  if (typeof t.unref === "function") t.unref();
+  return t;
 }
 
 function isLockActive(guildId) {
@@ -241,6 +269,7 @@ function getLogChannel(guild) {
 
 async function sendLog(guild, embed, dedupeKey = null) {
   try {
+    if (!guild) return;
     if (dedupeKey && dedupeLog(dedupeKey, 4000)) return;
 
     const logChannel = getLogChannel(guild);
@@ -249,14 +278,16 @@ async function sendLog(guild, embed, dedupeKey = null) {
     await logChannel.send({
       embeds: [embed],
       allowedMentions: { parse: [] }
+    }).catch((err) => {
+      console.error("[LOG] Log gönderilemedi:", err);
     });
   } catch (err) {
-    console.error("[LOG] Log gönderilemedi:", err);
+    console.error("[LOG] sendLog genel hata:", err);
   }
 }
 
 function getBotMember(guild) {
-  return guild.members.me ?? null;
+  return guild?.members?.me ?? null;
 }
 
 function botCanBan(me, targetMember) {
@@ -277,6 +308,35 @@ function botCanViewAudit(me) {
   return me.permissions.has(PermissionsBitField.Flags.ViewAuditLog);
 }
 
+function clearVoiceReconnectTimer(guildId) {
+  const t = voiceReconnectTimers.get(guildId);
+  if (t) {
+    clearTimeout(t);
+    voiceReconnectTimers.delete(guildId);
+  }
+}
+
+function scheduleVoiceReconnect(guild, immediate = false) {
+  if (!guild || !VOICE_CHANNEL_ID || shuttingDown) return;
+
+  const guildId = guild.id;
+  clearVoiceReconnectTimer(guildId);
+
+  const attempts = (voiceReconnectState.get(guildId) || 0) + 1;
+  voiceReconnectState.set(guildId, attempts);
+
+  const delay = immediate ? 1500 : Math.min(5000 * attempts, 30000);
+
+  console.log(`[VOICE] ${delay}ms sonra yeniden bağlanma denenecek. Attempt=${attempts}`);
+
+  const timer = safeTimeout(async () => {
+    voiceReconnectTimers.delete(guildId);
+    await joinConfiguredVoice(guild, true);
+  }, delay);
+
+  voiceReconnectTimers.set(guildId, timer);
+}
+
 async function fetchExecutorFromAudit(guild, expectedNewCode = null) {
   const me = getBotMember(guild);
   if (!botCanViewAudit(me)) {
@@ -286,11 +346,11 @@ async function fetchExecutorFromAudit(guild, expectedNewCode = null) {
 
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      await sleep(1200 * attempt);
+      await sleep(1000 * attempt);
 
       const logs = await guild.fetchAuditLogs({
         type: AuditLogEvent.GuildUpdate,
-        limit: 8
+        limit: 10
       });
 
       const entry = logs.entries.find((e) => {
@@ -300,16 +360,13 @@ async function fetchExecutorFromAudit(guild, expectedNewCode = null) {
         const created = e.createdTimestamp || 0;
         if (Date.now() - created > 25_000) return false;
 
-        if (!e.changes || !Array.isArray(e.changes)) return true;
-
-        const vanityChange = e.changes.find((c) => c.key === "vanity_url_code");
+        const changes = Array.isArray(e.changes) ? e.changes : [];
+        const vanityChange = changes.find((c) => c.key === "vanity_url_code");
         if (!vanityChange) return false;
 
         if (expectedNewCode !== null) {
           const newValue = vanityChange.new ?? null;
-          if ((newValue || null) !== (expectedNewCode || null)) {
-            return false;
-          }
+          if ((newValue || null) !== (expectedNewCode || null)) return false;
         }
 
         return true;
@@ -365,7 +422,7 @@ async function revertVanity(guild, protectedCode) {
       return { ok: false, reason: "Korunan vanity kodu bulunamadı." };
     }
 
-    const me = getBotMember(guild);
+    const me = getBotMember(guild) || await guild.members.fetchMe().catch(() => null);
     if (!botCanManageGuild(me)) {
       return { ok: false, reason: "Botta ManageGuild izni yok." };
     }
@@ -443,10 +500,12 @@ async function setBotPresence() {
 }
 
 async function joinConfiguredVoice(guild, force = false) {
-  if (!VOICE_CHANNEL_ID) return;
-  if (voiceJoinInProgress && !force) return;
+  if (!guild || !VOICE_CHANNEL_ID || shuttingDown) return;
 
-  voiceJoinInProgress = true;
+  const guildId = guild.id;
+  if (voiceJoinLocks.get(guildId) && !force) return;
+
+  voiceJoinLocks.set(guildId, true);
 
   try {
     const channel = await guild.channels.fetch(VOICE_CHANNEL_ID).catch(() => null);
@@ -459,7 +518,7 @@ async function joinConfiguredVoice(guild, force = false) {
       channel.type !== ChannelType.GuildVoice &&
       channel.type !== ChannelType.GuildStageVoice
     ) {
-      console.log("[VOICE] Belirtilen kanal bir ses kanalı değil.");
+      console.log("[VOICE] Belirtilen kanal ses/stage kanalı değil.");
       return;
     }
 
@@ -471,19 +530,25 @@ async function joinConfiguredVoice(guild, force = false) {
       return;
     }
 
-    const existing = getVoiceConnection(guild.id);
+    const existing = getVoiceConnection(guildId);
     if (existing) {
       const sameChannel = existing.joinConfig?.channelId === channel.id;
+      const status = existing.state?.status;
       const healthy = [
         VoiceConnectionStatus.Ready,
         VoiceConnectionStatus.Connecting,
         VoiceConnectionStatus.Signalling
-      ].includes(existing.state.status);
+      ].includes(status);
 
-      if (sameChannel && healthy && !force) return;
+      if (sameChannel && healthy && !force) {
+        return;
+      }
 
       try {
-        existing.removeAllListeners?.();
+        existing.removeAllListeners();
+      } catch {}
+
+      try {
         existing.destroy();
       } catch (err) {
         console.error("[VOICE] Eski bağlantı kapatılamadı:", err);
@@ -499,52 +564,70 @@ async function joinConfiguredVoice(guild, force = false) {
       group: guild.id
     });
 
-    connection.on("error", async (err) => {
+    connection.on("error", (err) => {
       console.error("[VOICE] Connection error:", err);
       try {
         connection.destroy();
       } catch {}
-      await sleep(5000);
-      await joinConfiguredVoice(guild, true);
+      scheduleVoiceReconnect(guild);
     });
 
-    connection.on("stateChange", async (_, newState) => {
+    connection.on("stateChange", async (oldState, newState) => {
       try {
-        if (
-          newState.status === VoiceConnectionStatus.Disconnected ||
-          newState.status === VoiceConnectionStatus.Destroyed
-        ) {
-          const attempts = (voiceReconnectState.get(guild.id) || 0) + 1;
-          voiceReconnectState.set(guild.id, attempts);
+        const oldStatus = oldState?.status;
+        const newStatus = newState?.status;
 
-          const wait = Math.min(5000 * attempts, 30000);
-          console.log(`[VOICE] Bağlantı koptu. ${wait}ms sonra yeniden denenecek.`);
-          await sleep(wait);
-          await joinConfiguredVoice(guild, true);
+        if (oldStatus === newStatus) return;
+
+        if (newStatus === VoiceConnectionStatus.Ready) {
+          voiceReconnectState.set(guildId, 0);
+          clearVoiceReconnectTimer(guildId);
+          console.log(`[VOICE] Ses bağlantısı hazır: ${channel.name}`);
           return;
         }
 
-        if (newState.status === VoiceConnectionStatus.Ready) {
-          voiceReconnectState.set(guild.id, 0);
-          console.log(`[VOICE] Ses bağlantısı hazır: ${channel.name}`);
+        if (newStatus === VoiceConnectionStatus.Disconnected) {
+          try {
+            await Promise.race([
+              entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+              entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+            ]);
+            console.log("[VOICE] Geçici disconnect toparlandı.");
+            return;
+          } catch {
+            console.warn("[VOICE] Disconnect toparlanamadı, yeniden bağlanılacak.");
+            try {
+              connection.destroy();
+            } catch {}
+            scheduleVoiceReconnect(guild);
+            return;
+          }
+        }
+
+        if (newStatus === VoiceConnectionStatus.Destroyed) {
+          console.warn("[VOICE] Bağlantı destroyed oldu.");
+          scheduleVoiceReconnect(guild);
         }
       } catch (err) {
         console.error("[VOICE] stateChange hatası:", err);
+        scheduleVoiceReconnect(guild);
       }
     });
 
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-    voiceReconnectState.set(guild.id, 0);
+    voiceReconnectState.set(guildId, 0);
+    clearVoiceReconnectTimer(guildId);
     console.log(`[VOICE] Otomatik olarak "${channel.name}" kanalına katıldı.`);
   } catch (err) {
     console.error("[VOICE] Ses kanalına giriş hatası:", err);
+    scheduleVoiceReconnect(guild);
   } finally {
-    voiceJoinInProgress = false;
+    voiceJoinLocks.delete(guildId);
   }
 }
 
 async function bootstrap() {
-  if (bootstrapRunning) return;
+  if (bootstrapRunning || shuttingDown) return;
   bootstrapRunning = true;
 
   try {
@@ -572,6 +655,27 @@ async function bootstrap() {
     console.error("[BOOT] Bootstrap hatası:", err);
   } finally {
     bootstrapRunning = false;
+  }
+}
+
+async function bootstrapGuild(guild) {
+  if (!guild || guild.id !== GUILD_ID || shuttingDown) return;
+  if (guildBootstrapLocks.get(guild.id)) return;
+
+  guildBootstrapLocks.set(guild.id, true);
+  try {
+    await setBotPresence();
+
+    if (!startupFinished) {
+      await initializeProtectedVanity(guild);
+      startupFinished = true;
+    }
+
+    await joinConfiguredVoice(guild);
+  } catch (err) {
+    console.error("[BOOT-GUILD] Hata:", err);
+  } finally {
+    guildBootstrapLocks.delete(guild.id);
   }
 }
 
@@ -650,6 +754,40 @@ async function verifyVanityIntegrity(guild) {
   }
 }
 
+async function shutdown(code = 0, signal = "UNKNOWN") {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`[PROCESS] Shutdown başladı. signal=${signal} code=${code}`);
+
+  try {
+    clearVoiceReconnectTimer(GUILD_ID);
+  } catch {}
+
+  try {
+    const conn = getVoiceConnection(GUILD_ID);
+    if (conn) conn.destroy();
+  } catch (err) {
+    console.error("[PROCESS] Voice destroy hatası:", err);
+  }
+
+  try {
+    await client.destroy();
+  } catch (err) {
+    console.error("[PROCESS] Client destroy hatası:", err);
+  }
+
+  try {
+    await new Promise((resolve) => {
+      webServer.close(() => resolve());
+    });
+  } catch (err) {
+    console.error("[PROCESS] Web close hatası:", err);
+  }
+
+  process.exit(code);
+}
+
 /* =========================
    READY / RESUME
 ========================= */
@@ -661,6 +799,17 @@ client.once(Events.ClientReady, async () => {
 client.on("resume", async () => {
   console.log("[CLIENT] Resume oldu.");
   await bootstrap();
+});
+
+client.on("guildAvailable", async (guild) => {
+  if (guild.id !== GUILD_ID) return;
+  console.log("[GUILD] guildAvailable");
+  await bootstrapGuild(guild);
+});
+
+client.on("guildUnavailable", (guild) => {
+  if (guild.id !== GUILD_ID) return;
+  console.warn("[GUILD] guildUnavailable");
 });
 
 client.on("shardDisconnect", (event, id) => {
@@ -676,12 +825,26 @@ client.on("shardReady", async (id) => {
   await bootstrap();
 });
 
+client.on("shardResume", async (id, replayed) => {
+  console.log(`[SHARD] Resume | shard=${id} replayed=${replayed}`);
+  await bootstrap();
+});
+
+client.on("shardError", (err, id) => {
+  console.error(`[SHARD] Error | shard=${id}`, err);
+});
+
 client.on("error", (err) => {
   console.error("[CLIENT ERROR]", err);
 });
 
 client.on("warn", (info) => {
   console.warn("[CLIENT WARN]", info);
+});
+
+client.on("invalidated", async () => {
+  console.error("[CLIENT] Session invalidated.");
+  await shutdown(1, "INVALIDATED");
 });
 
 client.ws.on("debug", () => {});
@@ -722,9 +885,7 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
 
     if (executor && executor.id !== client.user.id) {
       const banReason =
-        `URL Guard: Sunucunun vanity URL'sini değiştirmeye veya silmeye çalıştı. ` +
-        `Korunan URL: ${protectedCode}`;
-
+        `URL Guard: Sunucunun vanity URL'sini değiştirmeye veya silmeye çalıştı. Korunan URL: ${protectedCode}`;
       banResult = await banExecutor(newGuild, executor, banReason);
     } else if (executor && executor.id === client.user.id) {
       banResult = { ok: false, reason: "İşlem bot tarafından yapıldı, ban atılmadı." };
@@ -802,8 +963,8 @@ client.on("guildUpdate", async (oldGuild, newGuild) => {
 /* =========================
    PERIODIC SELF-HEAL
 ========================= */
-setInterval(async () => {
-  if (keepAliveRunning) return;
+safeInterval(async () => {
+  if (keepAliveRunning || shuttingDown) return;
   keepAliveRunning = true;
 
   try {
@@ -820,10 +981,11 @@ setInterval(async () => {
 
     if (VOICE_CHANNEL_ID) {
       const connection = getVoiceConnection(guild.id);
+      const status = connection?.state?.status || null;
       const broken =
         !connection ||
-        connection.state.status === VoiceConnectionStatus.Destroyed ||
-        connection.state.status === VoiceConnectionStatus.Disconnected;
+        status === VoiceConnectionStatus.Destroyed ||
+        status === VoiceConnectionStatus.Disconnected;
 
       if (broken) {
         console.log("[SELF-HEAL] Ses bağlantısı eksik/kırık, yeniden bağlanılıyor.");
@@ -840,7 +1002,7 @@ setInterval(async () => {
 /* =========================
    LIGHT MEMORY WATCHER
 ========================= */
-setInterval(() => {
+safeInterval(() => {
   try {
     const mem = process.memoryUsage();
     const rssMb = Math.round(mem.rss / 1024 / 1024);
@@ -874,39 +1036,17 @@ process.on("uncaughtExceptionMonitor", (err) => {
 });
 
 process.on("SIGTERM", async () => {
-  console.log("[PROCESS] SIGTERM alındı.");
-  try {
-    const conn = getVoiceConnection(GUILD_ID);
-    if (conn) conn.destroy();
-  } catch {}
-  try {
-    client.destroy();
-  } catch {}
-  try {
-    webServer.close();
-  } catch {}
-  process.exit(0);
+  await shutdown(0, "SIGTERM");
 });
 
 process.on("SIGINT", async () => {
-  console.log("[PROCESS] SIGINT alındı.");
-  try {
-    const conn = getVoiceConnection(GUILD_ID);
-    if (conn) conn.destroy();
-  } catch {}
-  try {
-    client.destroy();
-  } catch {}
-  try {
-    webServer.close();
-  } catch {}
-  process.exit(0);
+  await shutdown(0, "SIGINT");
 });
 
 /* =========================
    LOGIN
 ========================= */
-client.login(TOKEN).catch((err) => {
+client.login(TOKEN).catch(async (err) => {
   console.error("[LOGIN] Bot giriş yapamadı:", err);
-  process.exit(1);
+  await shutdown(1, "LOGIN_FAIL");
 });
