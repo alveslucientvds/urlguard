@@ -24,7 +24,7 @@ const {
    BASIC RUNTIME HARDENING
 ========================= */
 Error.stackTraceLimit = 50;
-process.setMaxListeners(30);
+process.setMaxListeners(50);
 
 /* =========================
    ENV
@@ -48,6 +48,7 @@ const VANITY_CODE_REGEX = /^[a-zA-Z0-9-]{2,32}$/;
 
 function normalizeVanityCode(input) {
   if (!input) return null;
+
   let value = String(input).trim();
 
   value = value
@@ -67,48 +68,6 @@ function normalizeVanityCode(input) {
 const PROTECTED_VANITY = normalizeVanityCode(PROTECTED_VANITY_RAW);
 
 /* =========================
-   WEB SERVER / UPTIMEROBOT
-========================= */
-const app = express();
-app.disable("x-powered-by");
-
-app.get("/", (_, res) => {
-  res.status(200).send("URL Guard bot aktif.");
-});
-
-app.get("/health", (_, res) => {
-  res.status(200).json({
-    ok: true,
-    ready: client.isReady(),
-    bot: client?.user?.tag || "loading",
-    uptimeSeconds: Math.floor(process.uptime()),
-    memoryRss: process.memoryUsage().rss,
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.get("/ping", (_, res) => {
-  res.status(200).json({
-    status: "online",
-    ready: client.isReady(),
-    wsPing: client.ws?.ping ?? null,
-    uptimeSeconds: Math.floor(process.uptime())
-  });
-});
-
-app.use((_, res) => {
-  res.status(200).send("Bot aktif.");
-});
-
-const webServer = app.listen(PORT, "0.0.0.0", () => {
-  console.log(`[WEB] Sunucu ${PORT} portunda aktif.`);
-});
-
-webServer.on("error", (err) => {
-  console.error("[WEB] Sunucu hatası:", err);
-});
-
-/* =========================
    CLIENT
 ========================= */
 const client = new Client({
@@ -125,15 +84,76 @@ const client = new Client({
 });
 
 /* =========================
+   WEB SERVER / UPTIMEROBOT
+========================= */
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", true);
+
+app.get("/", (_, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).send("URL Guard bot aktif.");
+});
+
+app.get("/health", (_, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({
+    ok: true,
+    ready: client.isReady(),
+    bot: client?.user?.tag || "loading",
+    wsPing: client.ws?.ping ?? null,
+    uptimeSeconds: Math.floor(process.uptime()),
+    memoryRss: process.memoryUsage().rss,
+    guildId: GUILD_ID,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get("/ping", (_, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  return res.status(200).json({
+    status: "online",
+    ready: client.isReady(),
+    wsPing: client.ws?.ping ?? null,
+    uptimeSeconds: Math.floor(process.uptime()),
+    timestamp: Date.now()
+  });
+});
+
+app.use((_, res) => {
+  res.status(200).send("Bot aktif.");
+});
+
+const webServer = app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[WEB] Sunucu ${PORT} portunda aktif.`);
+});
+
+webServer.keepAliveTimeout = 65_000;
+webServer.headersTimeout = 66_000;
+webServer.requestTimeout = 60_000;
+
+webServer.on("error", (err) => {
+  console.error("[WEB] Sunucu hatası:", err);
+});
+
+webServer.on("clientError", (err, socket) => {
+  console.error("[WEB] Client hatası:", err?.message || err);
+  try {
+    socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+  } catch {}
+});
+
+/* =========================
    CACHE / STATE
 ========================= */
-const vanityCache = new Map();        // guildId -> protected vanity
-const revertLocks = new Map();        // guildId -> unlock timestamp
-const recentActions = new Map();      // key -> timestamp
-const recentLogKeys = new Map();      // anti log spam
-const voiceReconnectState = new Map();// guildId -> attempt count
+const vanityCache = new Map();          // guildId -> protected vanity
+const revertLocks = new Map();          // guildId -> unlock timestamp
+const recentActions = new Map();        // key -> timestamp
+const recentLogKeys = new Map();        // anti log spam
+const voiceReconnectState = new Map();  // guildId -> reconnect attempt count
 
 let startupFinished = false;
+let bootstrapRunning = false;
 let voiceJoinInProgress = false;
 let keepAliveRunning = false;
 
@@ -153,6 +173,7 @@ function sleep(ms) {
 
 function cleanString(value, max = 1000) {
   if (value == null) return "Yok";
+
   const str = String(value)
     .replace(/[`]/g, "'")
     .replace(/<@&?\d+>/g, "[mention-redacted]")
@@ -161,7 +182,7 @@ function cleanString(value, max = 1000) {
     .replace(/@here/g, "@ here")
     .trim();
 
-  return str.length > max ? `${str.slice(0, max - 3)}...` : str || "Yok";
+  return str.length > max ? `${str.slice(0, max - 3)}...` : (str || "Yok");
 }
 
 function isLockActive(guildId) {
@@ -205,13 +226,16 @@ function cleanupMaps() {
   for (const [k, v] of revertLocks.entries()) {
     if (now >= v) revertLocks.delete(k);
   }
+
+  for (const [k, v] of voiceReconnectState.entries()) {
+    if (typeof v !== "number" || v < 0) voiceReconnectState.delete(k);
+  }
 }
 
 function getLogChannel(guild) {
   if (!LOG_CHANNEL_ID) return null;
   const channel = guild.channels.cache.get(LOG_CHANNEL_ID);
-  if (!channel) return null;
-  if (!channel.isTextBased()) return null;
+  if (!channel || !channel.isTextBased()) return null;
   return channel;
 }
 
@@ -306,12 +330,8 @@ async function banExecutor(guild, executor, reason) {
       return { ok: false, reason: "İşlemi yapan kullanıcı bulunamadı." };
     }
 
-    const me =
-      guild.members.me || (await guild.members.fetchMe().catch(() => null));
-
-    const targetMember = await guild.members
-      .fetch(executor.id)
-      .catch(() => null);
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    const targetMember = await guild.members.fetch(executor.id).catch(() => null);
 
     if (!targetMember) {
       return { ok: false, reason: "Kullanıcı sunucuda bulunamadı." };
@@ -325,13 +345,17 @@ async function banExecutor(guild, executor, reason) {
     }
 
     await guild.members.ban(executor.id, {
-      reason: cleanString(reason, 480)
+      reason: cleanString(reason, 480),
+      deleteMessageSeconds: 0
     });
 
     return { ok: true };
   } catch (err) {
     console.error("[BAN] Ban atılamadı:", err);
-    return { ok: false, reason: cleanString(err.message || "Bilinmeyen hata", 300) };
+    return {
+      ok: false,
+      reason: cleanString(err?.message || "Bilinmeyen hata", 300)
+    };
   }
 }
 
@@ -354,7 +378,10 @@ async function revertVanity(guild, protectedCode) {
     return { ok: true };
   } catch (err) {
     console.error("[REVERT] Vanity geri alınamadı:", err);
-    return { ok: false, reason: cleanString(err.message || "Bilinmeyen hata", 300) };
+    return {
+      ok: false,
+      reason: cleanString(err?.message || "Bilinmeyen hata", 300)
+    };
   }
 }
 
@@ -387,11 +414,7 @@ async function initializeProtectedVanity(guild) {
 
     await sendLog(guild, embed, `init:${guild.id}`);
 
-    if (
-      PROTECTED_VANITY &&
-      currentCode &&
-      currentCode !== PROTECTED_VANITY
-    ) {
+    if (PROTECTED_VANITY && currentCode && currentCode !== PROTECTED_VANITY) {
       console.warn(
         `[INIT] Mevcut vanity (${currentCode}) ile PROTECTED_VANITY (${PROTECTED_VANITY}) farklı.`
       );
@@ -419,9 +442,9 @@ async function setBotPresence() {
   }
 }
 
-async function joinConfiguredVoice(guild) {
+async function joinConfiguredVoice(guild, force = false) {
   if (!VOICE_CHANNEL_ID) return;
-  if (voiceJoinInProgress) return;
+  if (voiceJoinInProgress && !force) return;
 
   voiceJoinInProgress = true;
 
@@ -440,22 +463,12 @@ async function joinConfiguredVoice(guild) {
       return;
     }
 
-    const me = getBotMember(guild);
+    const me = getBotMember(guild) || await guild.members.fetchMe().catch(() => null);
     const permissions = channel.permissionsFor(me);
 
-    if (
-      !permissions ||
-      !permissions.has(PermissionsBitField.Flags.Connect)
-    ) {
+    if (!permissions || !permissions.has(PermissionsBitField.Flags.Connect)) {
       console.log("[VOICE] Botun ses kanalına bağlanma izni yok.");
       return;
-    }
-
-    if (
-      channel.type === ChannelType.GuildStageVoice &&
-      !permissions.has(PermissionsBitField.Flags.RequestToSpeak)
-    ) {
-      console.log("[VOICE] Stage kanalında RequestToSpeak izni yok.");
     }
 
     const existing = getVoiceConnection(guild.id);
@@ -467,9 +480,10 @@ async function joinConfiguredVoice(guild) {
         VoiceConnectionStatus.Signalling
       ].includes(existing.state.status);
 
-      if (sameChannel && healthy) return;
+      if (sameChannel && healthy && !force) return;
 
       try {
+        existing.removeAllListeners?.();
         existing.destroy();
       } catch (err) {
         console.error("[VOICE] Eski bağlantı kapatılamadı:", err);
@@ -481,7 +495,17 @@ async function joinConfiguredVoice(guild) {
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: true,
-      selfMute: false
+      selfMute: false,
+      group: guild.id
+    });
+
+    connection.on("error", async (err) => {
+      console.error("[VOICE] Connection error:", err);
+      try {
+        connection.destroy();
+      } catch {}
+      await sleep(5000);
+      await joinConfiguredVoice(guild, true);
     });
 
     connection.on("stateChange", async (_, newState) => {
@@ -496,11 +520,13 @@ async function joinConfiguredVoice(guild) {
           const wait = Math.min(5000 * attempts, 30000);
           console.log(`[VOICE] Bağlantı koptu. ${wait}ms sonra yeniden denenecek.`);
           await sleep(wait);
-          await joinConfiguredVoice(guild);
+          await joinConfiguredVoice(guild, true);
+          return;
         }
 
         if (newState.status === VoiceConnectionStatus.Ready) {
           voiceReconnectState.set(guild.id, 0);
+          console.log(`[VOICE] Ses bağlantısı hazır: ${channel.name}`);
         }
       } catch (err) {
         console.error("[VOICE] stateChange hatası:", err);
@@ -518,6 +544,9 @@ async function joinConfiguredVoice(guild) {
 }
 
 async function bootstrap() {
+  if (bootstrapRunning) return;
+  bootstrapRunning = true;
+
   try {
     const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
     if (!guild) {
@@ -541,6 +570,8 @@ async function bootstrap() {
     await joinConfiguredVoice(fullGuild);
   } catch (err) {
     console.error("[BOOT] Bootstrap hatası:", err);
+  } finally {
+    bootstrapRunning = false;
   }
 }
 
@@ -554,7 +585,6 @@ async function verifyVanityIntegrity(guild) {
 
     const liveCode = freshGuild.vanityURLCode || null;
     if (liveCode === protectedCode) return;
-
     if (isLockActive(guild.id)) return;
 
     setLock(guild.id, 10_000);
@@ -565,12 +595,14 @@ async function verifyVanityIntegrity(guild) {
     const revertResult = await revertVanity(freshGuild, protectedCode);
 
     let banResult = { ok: false, reason: "Yapan kişi bulunamadı." };
-    if (executor) {
+    if (executor && executor.id !== client.user.id) {
       banResult = await banExecutor(
         freshGuild,
         executor,
         `URL Guard self-heal: Vanity URL yetkisiz değişiklik. Korunan URL: ${protectedCode}`
       );
+    } else if (executor && executor.id === client.user.id) {
+      banResult = { ok: false, reason: "İşlem bot tarafından yapıldı, ban atılmadı." };
     }
 
     if (revertResult.ok) {
@@ -651,6 +683,8 @@ client.on("error", (err) => {
 client.on("warn", (info) => {
   console.warn("[CLIENT WARN]", info);
 });
+
+client.ws.on("debug", () => {});
 
 /* =========================
    URL GUARD
@@ -793,7 +827,7 @@ setInterval(async () => {
 
       if (broken) {
         console.log("[SELF-HEAL] Ses bağlantısı eksik/kırık, yeniden bağlanılıyor.");
-        await joinConfiguredVoice(guild);
+        await joinConfiguredVoice(guild, true);
       }
     }
   } catch (err) {
@@ -804,10 +838,31 @@ setInterval(async () => {
 }, 60_000);
 
 /* =========================
+   LIGHT MEMORY WATCHER
+========================= */
+setInterval(() => {
+  try {
+    const mem = process.memoryUsage();
+    const rssMb = Math.round(mem.rss / 1024 / 1024);
+    const heapMb = Math.round(mem.heapUsed / 1024 / 1024);
+
+    if (rssMb >= 450) {
+      console.warn(`[MEMORY] Yüksek kullanım algılandı | rss=${rssMb}MB heap=${heapMb}MB`);
+    }
+  } catch (err) {
+    console.error("[MEMORY] Kontrol hatası:", err);
+  }
+}, 120_000);
+
+/* =========================
    PROCESS SAFETY
 ========================= */
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
+});
+
+process.on("rejectionHandled", () => {
+  console.warn("[rejectionHandled] Sonradan handle edilen promise rejection algılandı.");
 });
 
 process.on("uncaughtException", (err) => {
@@ -819,17 +874,31 @@ process.on("uncaughtExceptionMonitor", (err) => {
 });
 
 process.on("SIGTERM", async () => {
+  console.log("[PROCESS] SIGTERM alındı.");
   try {
-    console.log("[PROCESS] SIGTERM alındı.");
+    const conn = getVoiceConnection(GUILD_ID);
+    if (conn) conn.destroy();
+  } catch {}
+  try {
     client.destroy();
+  } catch {}
+  try {
+    webServer.close();
   } catch {}
   process.exit(0);
 });
 
 process.on("SIGINT", async () => {
+  console.log("[PROCESS] SIGINT alındı.");
   try {
-    console.log("[PROCESS] SIGINT alındı.");
+    const conn = getVoiceConnection(GUILD_ID);
+    if (conn) conn.destroy();
+  } catch {}
+  try {
     client.destroy();
+  } catch {}
+  try {
+    webServer.close();
   } catch {}
   process.exit(0);
 });
